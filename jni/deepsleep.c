@@ -1,315 +1,164 @@
-//
-// Deepsleep forces device to deep sleep by accessing /sys/power/state
-// if it seems to be appropriate
-//
-// Version:  0.2
-// Date: 18. Aug 2014
-// Author Martin Zwicknagl: martin.zwicknagl@kirchbichl.net
-//
-//  This source code is distributed under the terms of
-//   GNU General Public License
-//   See LICENSE file for details
-//
-////////////////////////////////////////////////////////////////////////////
-
-#define VERSION "0.2, 19. Aug. 2014"
-
+/*
+ * deepsleep forces the Tolino device to deep sleep when the screen is turned "off".
+ * 
+ * Version:  0.3
+ * Date: 2014-09-13
+ * Authors: Martin Zwicknagl <martin.zwicknagl@kirchbichl.net>
+ *          Stefan Rado <tolino@sradonia.net>
+ * 
+ * 
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ * 
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ * 
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
-#define PROG_NAME   "DeepSleep"
 
-#define true ( 1 == 1 )
-#define false ( 1 == 0 )
+#define VERSION "0.3, 2014-09-13"
 
+#define PROP_BOOT_COMPLETE "sys.boot_completed"
 
-#define SYS_PWER_STATE "/sys/power/state"
-#define CPUFREQ_GOVERNOR              "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
-#define ONDEMAND_UPTHRESHOLD          "/sys/devices/system/cpu/cpufreq/ondemand/up_threshold"
-#define ONDEMAND_SAMPLING_DOWN_FACTOR "/sys/devices/system/cpu/cpufreq/ondemand/sampling_down_factor"
-#define ONDEMAND_IGNORE_NICE_LOAD     "/sys/devices/system/cpu/cpufreq/ondemand/ignore_nice_load"
+#define FILE_SYS_POWER_STATE               "/sys/power/state"
+#define FILE_CPUFREQ_GOVERNOR              "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
+#define FILE_ONDEMAND_UPTHRESHOLD          "/sys/devices/system/cpu/cpufreq/ondemand/up_threshold"
+#define FILE_ONDEMAND_SAMPLING_DOWN_FACTOR "/sys/devices/system/cpu/cpufreq/ondemand/sampling_down_factor"
+#define FILE_ONDEMAND_IGNORE_NICE_LOAD     "/sys/devices/system/cpu/cpufreq/ondemand/ignore_nice_load"
 
-#define ADB_OPEN        "/mnt/extsd/adb_open"
-#define ADB_PROPERTY    "persist.service.adb.enable"
-
-#define BOOT_COMPLETE  "sys.boot_completed"
-
-
-#define POWER_STATE_STRING "mPowerState"
-#define POWER_STATE_SLEEP  "mPowerState=0"
-
-#define SLEEP_CMD "mem"
-#define WAKE_CMD "on"
-
-
+#define MAX_PROPVALUE 255
 #define MAX_BUFFER 1024
 
-#define sleeping 0
-#define awake    1
+#define POLL_TIME 750000 // in us
 
 
-// POLL_TIME is in us
-#define POLL_TIME  750000
+void getProp(char* property, char* propValue) {
+	FILE *pipe_reader;
+	char str[MAX_PROPVALUE];
 
+	sprintf(str, "getprop %s", property);
 
-//#define LOGI(...) ((void)__android_log_print(ANDROID_LOG_INFO, PROG_NAME, __VA_ARGS__
+	if ((pipe_reader = popen(str, "r")) == NULL) {
+		printf("Error running getprop\n");
+		exit(1);
+	}
 
-char propValue[255];
-
-
-void errorMsg( char *str )
-{
-    printf("error: %s\n", str );
-  // LOGI( "error: ", str );
+	fgets(propValue, MAX_PROPVALUE, pipe_reader);
+	pclose(pipe_reader);
 }
 
-int fexist( char *filename )
-{
-    int res;
-    FILE *fp = fopen( filename, "r" );
-    if( fp )
-    { // exist
-        res = true;
-        fclose(fp);
-    }
-    else
-    { // doesnt exist
-        res = false;
-    }
+void setProp(char* property, char* propValue) {
+	FILE *pipe_reader;
+	char str[MAX_BUFFER];
 
-    return res;
+	sprintf(str, "setprop %s %s", property, propValue);
+	if ((pipe_reader = popen(str, "r")) == NULL) {
+		printf("Error running setprop\n");
+		exit(1);
+	}
+
+	pclose(pipe_reader);
 }
 
+void writeToFile(char *file, char *data) {
+	FILE *fp = fopen(file, "w"); // write mode
+	if (fp == NULL) {
+		printf("Error opening file %s\n", file);
+		exit(2);
+	}
 
+	printf("Writing \"%s\" to %s\n", data, file);
+	fprintf(fp, "%s", data);
 
-void getProp( char* property, char* propValue )
-{
-   FILE *pipe_reader;
-   char str[255];
-   sprintf( str, "getprop %s", property );
-   if ((pipe_reader = popen ( str, "r")) == NULL)
-   {
-      errorMsg("Fehler bei popen ...\n");
-      exit( 1 );
-   }
-
-   fgets( propValue, 255, pipe_reader );
-
-   pclose (pipe_reader);
+	fclose(fp);
 }
 
-void setProp( char* property, char* propValue )
-{
-   FILE *pipe_reader;
-   char str[255];
-   sprintf( str, "setprop %s %s", property, propValue );
-   if ((pipe_reader = popen ( str, "r")) == NULL)
-   {
-      errorMsg("Fehler bei popen ...\n");
-      exit( 1 );
-   }
+int getStatus() {
+	int status;
 
-   /*
-   fgets( propValue, 255, pipe_reader );
-*/
-   pclose (pipe_reader);
-}
+	FILE *pipe_reader;
+	if ((pipe_reader = popen("dumpsys power", "r")) == NULL) {
+		printf("Error running dumpsys\n");
+		exit(3);
+	}
 
+	char str[MAX_BUFFER];
+	while (!feof(pipe_reader)) {
+		fgets(str, MAX_BUFFER, pipe_reader);
 
+		if (strstr(str, "mPowerState=") != NULL) {
+			if (strstr(str, "mPowerState=0") != NULL) {
+				status = 0;
+			} else {
+				status = 1;
+			}
+			break;
+		}
+	}
 
+	pclose(pipe_reader);
 
-void adbOpen()
-{
-    if ( fexist( ADB_OPEN ) )
-    {
-        printf(" open ADB\n");
-        setProp( ADB_PROPERTY, "1" );
-    }
-    else
-    {
-        printf(" do NOT open ADB\n");
-    }
-    return;
+	return status;
 }
 
 
+int main(int argc, char* argv[]) {
+	char propValue[MAX_PROPVALUE];
+	int oldStatus, status;
 
-void setCpuGovernor( char *governor )
-{
-    if ( strlen(governor) == 0 )
-    {
-        errorMsg( "no governor set");
-    }
+	printf("DeepSleep for Tolino - version " VERSION "\n");
+	printf("by Martin Zwicknagl, put to GPL\n\n");
 
+	// Wait for boot to complete
+	getProp(PROP_BOOT_COMPLETE, propValue);
+	if (strncmp(propValue, "1", 1) != 0) {
+		printf("Waiting for boot to complete...\n");
+		do {
+			sleep(1);
+			getProp(PROP_BOOT_COMPLETE, propValue);
+		}
+		while (strncmp(propValue, "1", 1) != 0);
+	}
 
-   FILE *fp = fopen( CPUFREQ_GOVERNOR,"w"); // read mode
+	// Set CPU governor
+	printf("Setting CPU governor...\n");
+	writeToFile(FILE_CPUFREQ_GOVERNOR, "ondemand");
+	writeToFile(FILE_ONDEMAND_UPTHRESHOLD, "66");
+	writeToFile(FILE_ONDEMAND_SAMPLING_DOWN_FACTOR, "2");
+	writeToFile(FILE_ONDEMAND_IGNORE_NICE_LOAD, "0");
 
-   if( fp == NULL )
-   {
-      errorMsg("ERROR opening "CPUFREQ_GOVERNOR"\n" );
-      exit(-1);
-   }
+	// Power save loop
+	printf("Starting power save loop...\n");
+	status = getStatus();
+	while (1) {
+		oldStatus = status;
+		status = getStatus();
 
-   fprintf( fp, "%s", governor );
+		if (status != oldStatus) {
+			printf("Status change: %u -> %u\n", oldStatus, status);
+			if (status) {
+				// sleep -> awake
+				writeToFile(FILE_SYS_POWER_STATE, "on");
+			} else {
+				// awake -> sleep
+				writeToFile(FILE_SYS_POWER_STATE, "mem");
+			}
+		}
 
-   fclose(fp);
-   return;
+		usleep(POLL_TIME);
+	}
 
-}
-
-
-void genericSysFsWrite( char *file, char* data )
-{
-   FILE *fp = fopen( file, "w"); // read mode
-
-   if( fp == NULL )
-   {
-      errorMsg( "ERROR opening" );
-      errorMsg( file );
-      errorMsg( "\n" );
-      exit(-1);
-   }
-
-   printf( "write %s -> %s\n", data, file );
-
-   fprintf( fp, "%s", data );
-
-   fclose( fp );
-   return;
-}
-
-
-void setCpu( int dummy )
-{
-    setCpuGovernor( "ondemand" );
-    genericSysFsWrite( ONDEMAND_UPTHRESHOLD, "66" );
-    genericSysFsWrite( ONDEMAND_SAMPLING_DOWN_FACTOR, "2" );
-    genericSysFsWrite( ONDEMAND_IGNORE_NICE_LOAD, "0" );
-}
-
-
-void deepSleep()
-{
-
-   FILE *fp = fopen( SYS_PWER_STATE,"w"); // read mode
-
-   if( fp == NULL )
-   {
-      errorMsg("ERROR opening"SYS_PWER_STATE"\n" );
-      exit(-1);
-   }
-
-   fprintf( fp, "%s", SLEEP_CMD );
-
-   fclose(fp);
-   return;
-}
-
-void wakeUp()
-{
-   FILE *fp = fopen( SYS_PWER_STATE,"w"); // read mode
-
-   if( fp == NULL )
-   {
-      errorMsg( "ERROR opening"SYS_PWER_STATE"\n" );
-      exit(-1);
-   }
-
-   fprintf(fp, "%s",WAKE_CMD );
-
-   fclose(fp);
-   return;
-}
-
-int getState( int *isOn )
-{
-    int status;
-    *isOn = sleeping;
-
-   FILE *pipe_reader;
-   if ((pipe_reader = popen ("dumpsys power", "r")) == NULL)
-   {
-      errorMsg("Fehler bei popen ...\n");
-      exit( 1 );
-   }
-
-
-   char str[ MAX_BUFFER ];
-   while ( !feof( pipe_reader ) )
-   {
-        fgets( str, MAX_BUFFER, pipe_reader );
-
-//        printf( "%s", str );
-
-        if ( strstr( str, POWER_STATE_STRING ) != NULL )
-        {
-            if ( strstr( str, POWER_STATE_SLEEP ) != NULL )
-                *isOn = sleeping;
-            else
-                *isOn = awake;
-            break;
-        }
-   }
-
-   pclose (pipe_reader);
-
-   return (status);
-}
-
-
-
-
-int main( int argc, char* argv[])
-{
-    int oldStatus, status;
-
-    printf(" This ist the first C-Version of deepsleep\n");
-    printf(" Martin Zwicknagl, put to GPL\n");
-    printf(" Version %s\n", VERSION );
-
-    printf(" wait for boot completed\n");
-
-    do
-    {
-        getProp( BOOT_COMPLETE, propValue);
-        sleep(1);
-    }
-    while ( strncmp( propValue, "1", 1 ) != 0 );
-
-
-    printf(" set CPU governor \n");
-    setCpu( 0 );
-
-    printf("open adb if /mnt/extsd/adb_open exits\n");
-    adbOpen();
-
-    printf(" start power save\n");
-    getState( &status );
-
-   // getCacheDir();
-    do
-    {
-        oldStatus = status;
-        getState( &status);
-
-        printf( "old: %u   new %u\n", oldStatus, status );
-
-        if ( status == sleeping  && oldStatus == awake)
-        {
-            deepSleep();
-        }
-        else if ( status == awake && oldStatus == sleeping )
-            wakeUp();
-
-        usleep( POLL_TIME );
-    }
-    while ( true );
-
-
-    return 0;
+	return 0;
 }
